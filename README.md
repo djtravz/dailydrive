@@ -310,3 +310,8 @@ PRs welcome — especially for:
 ## License
 
 MIT — do whatever you want with it.
+
+
+changes
+
+have podcast episodes that only come out once a week and skip ones that have already been listened to 75%+ and then find the next one to listen to
