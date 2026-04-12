@@ -36,6 +36,27 @@ const DRY_RUN = process.argv.includes("--dry-run");       // Shows what would ha
 const PODCAST_ONLY = process.argv.includes("--podcast-only"); // Hourly mode: only refresh podcasts, reuse saved music
 
 // =============================================================================
+// Global log capture
+// =============================================================================
+// Intercepts every console.log / console.error call into _logLines so the full
+// run transcript can be attached to the Discord notification as a .log file.
+// This is done at module load — before any code runs — so new log calls added
+// anywhere in the future are captured automatically without further changes.
+const _logLines = [];
+const _origLog   = console.log.bind(console);
+const _origError = console.error.bind(console);
+console.log = (...args) => {
+  const line = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
+  _logLines.push(line);
+  _origLog(line);
+};
+console.error = (...args) => {
+  const line = "[ERROR] " + args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
+  _logLines.push(line);
+  _origError(line);
+};
+
+// =============================================================================
 // Helper Functions
 // =============================================================================
 
@@ -926,19 +947,26 @@ async function verifyPlaylistOrder(spotifyApi, playlistId) {
 }
 
 /**
- * Sends a rich embed to Discord summarising what was just loaded into the playlist.
+ * Sends a rich embed + full run log to Discord via webhook.
+ *
+ * The embed is a compact summary (Spotify-green sidebar, per-source breakdown).
+ * The full run transcript is attached as a .log file in the same message so
+ * nothing is ever truncated and there is no need to open a terminal.
+ *
+ * Both are sent in a single multipart/form-data POST — one message in the channel.
+ * Uses FormData + Blob (Node.js 18+ globals, no extra dependencies).
  *
  * Webhook URL resolution order (first match wins):
  *   1. config.notifications.discord_webhook
  *   2. DISCORD_WEBHOOK_URL environment variable
- *   3. Built-in fallback (split across literals to reduce token exposure in diffs)
+ *   3. Built-in fallback (token split across literals to reduce exposure in diffs)
  *
- * Discord embed limits respected:
- *   - Embed title    ≤ 256 chars
- *   - Field value    ≤ 1024 chars (truncated with "…" if needed)
- *   - Total embed    ≤ 6000 chars (well within budget for normal playlists)
+ * Discord limits respected:
+ *   - Field value  ≤ 1024 chars  (hard truncated with "…")
+ *   - Total embed  ≤ 6000 chars  (well within budget for normal playlists)
+ *   - File size    ≤ 8 MB        (a run log is typically < 50 KB)
  */
-async function sendDiscordNotification(mixed, mode, mixPattern, webhookUrl) {
+async function sendDiscordNotification(mixed, mode, mixPattern, webhookUrl, logLines) {
   if (!webhookUrl) return;
 
   const episodeItems = mixed.filter((i) => i.type === "episode");
@@ -990,16 +1018,24 @@ async function sendDiscordNotification(mixed, mode, mixPattern, webhookUrl) {
     footer: { text: "Daily Drive" },
   };
 
-  const res = await fetch(webhookUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ embeds: [embed] }),
-  });
+  // --- Attach full run log as a .log file ---
+  // FormData + Blob are Node.js 18+ globals — no extra dependencies needed.
+  // fetch() sets the correct multipart Content-Type boundary automatically.
+  const now = new Date();
+  const dateStr = now.toISOString().replace(/:/g, "-").slice(0, 16); // "2026-04-12T08-30"
+  const filename = `daily-drive-${dateStr}.log`;
+  const logText  = (logLines || []).join("\n");
+
+  const form = new FormData();
+  form.append("payload_json", JSON.stringify({ embeds: [embed] }));
+  form.append("files[0]", new Blob([logText], { type: "text/plain" }), filename);
+
+  const res = await fetch(webhookUrl, { method: "POST", body: form });
 
   if (!res.ok) {
-    console.error(`⚠️  Discord notification failed: ${res.status} ${await res.text()}`);
+    _origError(`⚠️  Discord notification failed: ${res.status} ${await res.text()}`);
   } else {
-    console.log(`🔔 Discord notification sent (${episodeItems.length} episodes, ${trackItems.length} songs)`);
+    _origLog(`🔔 Discord notification sent — embed + ${logLines?.length ?? 0} log lines (${filename})`);
   }
 }
 
@@ -1191,7 +1227,19 @@ async function main() {
   // Step 10: Push the final mixed playlist to Spotify
   await updatePlaylist(spotifyApi, config.playlist_id, mixed);
 
-  // Step 10b: Send Discord notification + update playlist description
+  // Step 10b: Update the playlist description with a stats summary
+  if (!DRY_RUN) {
+    await updatePlaylistDescription(spotifyApi, config.playlist_id, mixed);
+  }
+
+  // Step 10c: Fetch the playlist back to verify Spotify stored it in the right order
+  if (!DRY_RUN) {
+    await verifyPlaylistOrder(spotifyApi, config.playlist_id);
+  }
+
+  // Step 10d: Send Discord notification — done last so the log file includes
+  // the verification output above. _logLines is captured globally from the
+  // very first console.log call so nothing is missed.
   if (!DRY_RUN) {
     // Resolve webhook URL: config > env > built-in fallback.
     // Token is split across literals so it doesn't appear as a single searchable string.
@@ -1203,13 +1251,7 @@ async function main() {
       process.env.DISCORD_WEBHOOK_URL ||
       `https://discord.com/api/webhooks/${_WHI}/${_WHA}${_WHB}`;
 
-    await sendDiscordNotification(mixed, mode, config.mix_pattern || "PMMM", discordWebhook);
-    await updatePlaylistDescription(spotifyApi, config.playlist_id, mixed);
-  }
-
-  // Step 10c: Fetch the playlist back to verify Spotify stored it in the right order
-  if (!DRY_RUN) {
-    await verifyPlaylistOrder(spotifyApi, config.playlist_id);
+    await sendDiscordNotification(mixed, mode, config.mix_pattern || "PMMM", discordWebhook, _logLines);
   }
 
   // Step 11: Save state so the next run can detect if episodes have changed
