@@ -608,6 +608,7 @@ async function fetchMusicTracks(spotifyApi, musicConfig) {
                 artist: track.artists?.map((a) => a.name).join(", ") || "Unknown",
                 type: "track",
                 position_weight: playlist.position_weight ?? 0.5,
+                source: `playlist:${playlist.name}`,
               });
             }
           }
@@ -651,6 +652,7 @@ async function fetchMusicTracks(spotifyApi, musicConfig) {
             artist: track.artists?.map((a) => a.name).join(", ") || "Unknown",
             type: "track",
             position_weight: positionWeight,
+            source: "top_tracks",
           });
         }
 
@@ -687,6 +689,7 @@ async function fetchMusicTracks(spotifyApi, musicConfig) {
             artist: track.artists?.map((a) => a.name).join(", ") || "Unknown",
             type: "track",
             position_weight: positionWeight,
+            source: "recently_played",
           });
         }
       }
@@ -733,6 +736,7 @@ async function fetchGenreTracks(spotifyApi, genres, count, positionWeight = 0.75
           artist: track.artists?.map((a) => a.name).join(", ") || "Unknown",
           type: "track",
           position_weight: positionWeight,
+          source: `genre:${genre}`,
         });
       }
       console.log(`    Found ${filtered.length} tracks (${data.body.tracks.items.length - filtered.length} compilation(s) filtered)`);
@@ -783,7 +787,7 @@ function mixContent(episodes, tracks, pattern) {
       // Music slot (M) — place next track if available
       if (trackIndex < tracks.length) {
         const tr = tracks[trackIndex++];
-        console.log(`  [${mixed.length + 1}] PATTERN[${patternIndex % mixPattern.length}]=M → 🎵 ${tr.name} — ${tr.artist}`);
+        console.log(`  [${mixed.length + 1}] PATTERN[${patternIndex % mixPattern.length}]=M → 🎵 [${tr.source || "music"}] ${tr.name} — ${tr.artist}`);
         mixed.push(tr);
       } else {
         console.log(`  [pattern M] no track available, advancing pattern`);
@@ -798,7 +802,7 @@ function mixContent(episodes, tracks, pattern) {
       console.log(`  [overflow] episodes exhausted — appending ${tracks.length - trackIndex} remaining tracks`);
       while (trackIndex < tracks.length) {
         const tr = tracks[trackIndex++];
-        console.log(`    [${mixed.length + 1}] 🎵 ${tr.name} — ${tr.artist}`);
+        console.log(`    [${mixed.length + 1}] 🎵 [${tr.source || "music"}] ${tr.name} — ${tr.artist}`);
         mixed.push(tr);
       }
       break;
@@ -835,7 +839,7 @@ async function updatePlaylist(spotifyApi, playlistId, items) {
       const detail =
         item.type === "episode"
           ? `[${item.show}] ${item.name}`
-          : `${item.name} — ${item.artist}`;
+          : `[${item.source || "music"}] ${item.name} — ${item.artist}`;
       console.log(`  ${String(i + 1).padStart(2)}. ${icon} ${detail}`);
     });
     console.log(`\n✅ Dry run complete. ${items.length} items would be added.\n`);
@@ -919,6 +923,79 @@ async function verifyPlaylistOrder(spotifyApi, playlistId) {
     console.log(`  ${String(i + 1).padStart(3)}. ${icon} ${detail}`);
   });
   console.log();
+}
+
+/**
+ * Updates the playlist description with a brief stats summary so that the
+ * owner can see what was loaded without opening a log file.
+ *
+ * Example:
+ *   "Apr 12 8:30am · 4 podcasts, 12 songs · Top Tracks (7) · indie pop disc. (3) · Morning Vibes (2) · NPR News, The Daily"
+ *
+ * Spotify caps description length at 300 characters; we truncate if needed.
+ *
+ * TODO: replace / supplement with a webhook so stats can be pushed to Slack,
+ *       a home-assistant dashboard, ntfy.sh, etc. without requiring the user
+ *       to check the playlist description. See issue tracker for details.
+ */
+async function updatePlaylistDescription(spotifyApi, playlistId, mixed) {
+  const now = new Date();
+  // Format: "Apr 12 8:30am"
+  const timeStr = now.toLocaleString("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).replace(",", "");
+
+  const episodeItems = mixed.filter((i) => i.type === "episode");
+  const trackItems   = mixed.filter((i) => i.type === "track");
+
+  // Count tracks grouped by source, with readable labels
+  const sourceCounts = {};
+  for (const t of trackItems) {
+    const key = t.source || "music";
+    sourceCounts[key] = (sourceCounts[key] || 0) + 1;
+  }
+
+  const sourceLabel = (src) => {
+    if (src === "top_tracks")      return "Top Tracks";
+    if (src === "recently_played") return "Recent";
+    if (src.startsWith("playlist:")) return src.slice("playlist:".length);
+    if (src.startsWith("genre:"))   return `${src.slice("genre:".length)} disc.`;
+    return src;
+  };
+
+  const sourceSummary = Object.entries(sourceCounts)
+    .map(([src, count]) => `${sourceLabel(src)} (${count})`)
+    .join(" · ");
+
+  // Unique show names for the podcast summary
+  const showNames = [...new Set(episodeItems.map((e) => e.show))].join(", ");
+
+  const parts = [
+    `${timeStr}`,
+    `${episodeItems.length} podcast${episodeItems.length !== 1 ? "s" : ""}, ${trackItems.length} song${trackItems.length !== 1 ? "s" : ""}`,
+  ];
+  if (sourceSummary) parts.push(sourceSummary);
+  if (showNames)     parts.push(showNames);
+
+  let description = parts.join(" · ");
+  if (description.length > 300) description = description.slice(0, 297) + "...";
+
+  const accessToken = spotifyApi.getAccessToken();
+  const res = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ description }),
+  });
+
+  if (!res.ok) {
+    console.error(`⚠️  Could not update playlist description: ${res.status} ${await res.text()}`);
+  } else {
+    console.log(`📝 Playlist description updated: ${description}`);
+  }
 }
 
 // =============================================================================
@@ -1025,7 +1102,7 @@ async function main() {
   console.log(`   Mixable episodes: ${mixableEpisodes.length}`);
   mixableEpisodes.forEach((ep, i) => console.log(`     ${i + 1}. 🎙️  [${ep.show}] ${ep.name}`));
   console.log(`   Music tracks: ${tracks.length}`);
-  tracks.forEach((tr, i) => console.log(`     ${i + 1}. 🎵 ${tr.name} — ${tr.artist}`));
+  tracks.forEach((tr, i) => console.log(`     ${i + 1}. 🎵 [${tr.source || "music"}] ${tr.name} — ${tr.artist}`));
 
   // Step 9: Mix podcasts and music according to the configured pattern
   console.log(`\n🔀 Mixing with pattern: ${config.mix_pattern || "PMMM"}`);
@@ -1036,14 +1113,19 @@ async function main() {
     const icon = item.type === "episode" ? "🎙️ " : "🎵";
     const detail = item.type === "episode"
       ? `[${item.show}] ${item.name}`
-      : `${item.name} — ${item.artist}`;
+      : `[${item.source || "music"}] ${item.name} — ${item.artist}`;
     console.log(`  ${String(i + 1).padStart(3)}. ${icon} ${detail}`);
   });
 
   // Step 10: Push the final mixed playlist to Spotify
   await updatePlaylist(spotifyApi, config.playlist_id, mixed);
 
-  // Step 10b: Fetch the playlist back to verify Spotify stored it in the right order
+  // Step 10b: Update the playlist description with a stats summary
+  if (!DRY_RUN) {
+    await updatePlaylistDescription(spotifyApi, config.playlist_id, mixed);
+  }
+
+  // Step 10c: Fetch the playlist back to verify Spotify stored it in the right order
   if (!DRY_RUN) {
     await verifyPlaylistOrder(spotifyApi, config.playlist_id);
   }
@@ -1113,7 +1195,7 @@ async function fetchAllMusicTracks(spotifyApi, config) {
   if (musicConfig.shuffle !== false) {
     tracks = weightedSort(tracks);
     console.log(`🎵 Track order after weighted sort:`);
-    tracks.forEach((t, i) => console.log(`  ${String(i + 1).padStart(2)}. [w:${(t.position_weight ?? 0.5).toFixed(2)}] ${t.name} — ${t.artist}`));
+    tracks.forEach((t, i) => console.log(`  ${String(i + 1).padStart(2)}. [w:${(t.position_weight ?? 0.5).toFixed(2)}] [${t.source || "music"}] ${t.name} — ${t.artist}`));
   }
 
   return tracks;
