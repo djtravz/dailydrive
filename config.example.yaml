@@ -7,12 +7,10 @@
 # For help getting your Spotify credentials, see README.md
 # =============================================================================
 
-# --- Spotify App Credentials ---
-# Get these from https://developer.spotify.com/dashboard
+# --- Spotify App Settings ---
+# client_id and client_secret go in .env (see .env.example), not here.
 # IMPORTANT: Also add your Spotify email in Dashboard > User Management
 spotify:
-  client_id: "your-client-id-here"
-  client_secret: "your-client-secret-here"
   # IMPORTANT: Must use 127.0.0.1, NOT localhost (Spotify removed localhost support Nov 2025)
   redirect_uri: "http://127.0.0.1:8888/callback"
 
@@ -44,13 +42,47 @@ podcasts:
     episodes: 1
     position: first         # Always plays first, before the mix pattern
 
-  - name: "Freakonomics Radio"
-    id: "6z4NLXyHPga1UmSJsPK7G1"
+  - name: "NPR Up First"
+    id: "2mTUnDkuKUkhiueKcVWoP0"
     episodes: 1
+    backup:                            # if today's ep is missing or already listened,
+      - name: "NPR Politics Podcast"   # try these shows in order
+        id: "4BmcSDMUFIi6FQlnOPGnMi"
+      - name: "Consider This from NPR"
+        id: "6QFk4k5FGZHZbCGOqMOqHp"
+
+  - name: "NPR Up First Sunday"        # separate slot so it mixes at its own position
+    id: "2mTUnDkuKUkhiueKcVWoP0"       # same show ID — sunday_only filters to Sunday eps
+    sunday_only: true                  # only adds episode if most recent Sunday is unlistened
 
   - name: "The Daily"
     id: "3IM0lmZxpFAY7CwMuv9H4g"
     episodes: 1
+    unstarted_backfill: 3              # also include up to 3 older episodes never started at all
+
+# --- Podcast Groups (optional) ---
+# Each group contributes exactly one episode per playlist refresh:
+# the most recent unfinished or unstarted episode across all shows in the group.
+# Great for longer-form shows where you rotate between a few options.
+#
+# Priority order within a group:
+#   1. In-progress episodes (started but not fully played) — most recently published first
+#   2. Unstarted episodes — most recently published first
+#   Fully-played episodes are always skipped.
+#
+# Requires re-running `npm run setup` once to grant the new OAuth scope.
+#
+# podcast_groups:
+#   - name: "Long-form rotation"
+#     shows:
+#       - name: "The Daily"
+#         id: "3IM0lmZxpFAY7CwMuv9H4g"
+#       - name: "The Journal."
+#         id: "0KxdEdeY2Wb3zr28dMlQva"
+#       - name: "Freakonomics Radio"
+#         id: "6z4NLXyHPga1UmSJsPK7G1"
+#     episodes: 1        # how many to pick from the group (default: 1)
+#     # position: first  # optional: pin this episode to the top of the playlist
 
 # --- Music Sources ---
 # Where to pull songs from. You can mix and match multiple sources.
@@ -71,6 +103,14 @@ music:
   #   - pop rock
   #   - indie pop
   #   - dance pop
+
+  # Recently played tracks — good "On Repeat" equivalent.
+  # Note: Spotify's own algorithmic playlists (Discover Weekly, Release Radar,
+  # On Repeat) are NOT accessible via the Web API — use this + genre search instead.
+  # recently_played:
+  #   enabled: true
+  #   count: 20              # max 50 (Spotify API limit)
+  #   position_weight: 0.25  # 0.0 = front, 1.0 = back
 
   # Pull songs from existing playlists (optional)
   # Find playlist IDs the same way as your target playlist above

@@ -11,9 +11,7 @@
 spotify-token.json
 *token*.json
 
-# User config — contains client_id, client_secret, playlist IDs
-config.yaml
-config.yml
+# Local config overrides (not the main config.yaml, which is tracked)
 config.local.*
 
 # Environment files — may contain API keys
@@ -23,6 +21,7 @@ config.local.*
 .env.production
 .env.staging
 .env.development
+!.env.example
 
 # Generic secrets patterns
 *.pem

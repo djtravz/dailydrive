@@ -13,6 +13,14 @@ const yaml = require("js-yaml");
 const SpotifyWebApi = require("spotify-web-api-node");
 const express = require("express");
 
+// Load .env (same pattern as taste-profile.js — no dotenv dependency)
+if (fs.existsSync(".env")) {
+  for (const line of fs.readFileSync(".env", "utf8").split("\n")) {
+    const match = line.match(/^([^#=]+)=(.*)$/);
+    if (match) process.env[match[1].trim()] = match[2].trim();
+  }
+}
+
 const TOKEN_FILE = ".spotify-token.json";
 const CONFIG_FILE = "config.yaml";
 
@@ -22,24 +30,24 @@ if (fs.existsSync(TOKEN_FILE)) {
   console.log("🗑️  Deleted old token — starting fresh auth");
 }
 
-// --- Load config ---
+// --- Load config (for redirect_uri) ---
 if (!fs.existsSync(CONFIG_FILE)) {
   console.error("\n❌ config.yaml not found!");
-  console.error("   Run: cp config.example.yaml config.yaml");
-  console.error("   Then fill in your Spotify credentials.\n");
+  console.error("   Run: cp config.example.yaml config.yaml\n");
   process.exit(1);
 }
 
 const config = yaml.load(fs.readFileSync(CONFIG_FILE, "utf8"));
-const { client_id, client_secret, redirect_uri } = config.spotify;
+const redirect_uri = config.spotify?.redirect_uri || "http://127.0.0.1:8888/callback";
 
-if (
-  !client_id ||
-  !client_secret ||
-  client_id === "your-client-id-here"
-) {
-  console.error("\n❌ Please fill in your Spotify credentials in config.yaml");
-  console.error("   See README.md for how to get them.\n");
+// Credentials come from .env
+const client_id = process.env.SPOTIFY_CLIENT_ID;
+const client_secret = process.env.SPOTIFY_CLIENT_SECRET;
+
+if (!client_id || !client_secret || client_id === "your-client-id-here") {
+  console.error("\n❌ Spotify credentials not found.");
+  console.error("   Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env");
+  console.error("   See .env.example for the format.\n");
   process.exit(1);
 }
 
@@ -59,6 +67,7 @@ const SCOPES = [
   "user-read-private",
   "user-read-recently-played",
   "user-top-read",
+  "user-read-playback-position", // needed for resume_point on episodes (podcast groups feature)
 ];
 
 // --- Start a tiny web server to catch the callback ---

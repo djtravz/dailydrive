@@ -1,0 +1,145 @@
+# =============================================================================
+# Daily Drive Configuration
+# =============================================================================
+# This file is tracked in git — do NOT put secrets here.
+# Spotify credentials (client_id, client_secret) go in .env (see .env.example).
+# =============================================================================
+
+# --- Spotify App Settings ---
+# Credentials are loaded from .env — only the redirect URI lives here.
+# IMPORTANT: Also add your Spotify email in Dashboard > User Management
+spotify:
+  # IMPORTANT: Must use 127.0.0.1, NOT localhost (Spotify removed localhost support Nov 2025)
+  redirect_uri: "http://127.0.0.1:8888/callback"
+
+# --- Your Playlist ---
+# The playlist where Daily Drive content will be placed.
+# Create an empty playlist in Spotify, then right-click > Share > Copy link.
+# The ID is the part after "playlist/" in the URL.
+# Example: https://open.spotify.com/playlist/37i9dQZF1DX... → ID is "37i9dQZF1DX..."
+playlist_id: "0KKqUdCLny2SsPLmWtICwx"
+
+# --- Podcasts ---
+# Add your favorite podcasts here.
+# To find a show ID: open it in Spotify > Share > Copy link
+# Example: https://open.spotify.com/show/6z4NLXyHPga... → ID is "6z4NLXyHPga..."
+#
+# Use position: first to always place a podcast at the start of the playlist
+# (great for news briefings like NPR News Now)
+podcasts:
+  # Optional: Daily welcome greeting for your playlist.
+  # A short "Welcome to Your Daily Drive, it's Monday March 24th..." intro.
+  # You can create your own welcome show (see unscarcity-podcast repo), or skip this.
+  # - name: "Daily Drive Welcome"
+  #   id: "your-welcome-show-id"
+  #   episodes: 1
+  #   position: first
+
+  - name: "NPR Up First"
+    id: "2mTUnDkuKUkhiueKcVWoP0"
+    episodes: 1
+    skip_sunday: true                 # Sunday episode is handled by the NPR Up First Sunday entry
+    backup:                           # if today's episode is missing or already listened
+      - name: "NPR News Now"
+        id: "6BRSvIBNQnB68GuoXJRCnQ"
+      - name: "Consider This from NPR"
+        id: "3Z6JdCS2d0eFEpXHKI6WqH"
+
+  - name: "The Journal."
+    id: "0KxdEdeY2Wb3zr28dMlQva"
+    episodes: 1
+    unstarted_backfill: 5             # Also include older episodes never started at all
+  
+  - name: "NPR Up First Sunday"       # own playlist slot so it mixes lower
+    id: "2mTUnDkuKUkhiueKcVWoP0"      # same show, Sunday episodes only
+    sunday_only: true
+
+
+  # - name: "The Daily"
+  #   id: "3IM0lmZxpFAY7CwMuv9H4g"
+  #   episodes: 1
+
+podcast_groups:
+  - name: "Long-form rotation"
+    shows:
+      - name: "Wine About It"
+        id: "5WhcjOB1zqgVcy8tctxiPp"
+      # - name: "The Daily"
+      #   id: "3IM0lmZxpFAY7CwMuv9H4g"
+
+
+    # episodes: 1     ← default, one per group per playlist
+    # position: first ← optional pin
+
+# --- Music Sources ---
+# Where to pull songs from. You can mix and match multiple sources.
+# All sources are pooled together, shuffled, and trimmed to total_songs.
+music:
+  # Top tracks — pulls from your most-played songs
+  # Best signal for "songs I actually enjoy and don't skip"
+  top_tracks:
+    enabled: true
+    time_range: "short_term"   # short_term (~4 weeks), medium_term (~6 months), long_term (all time)
+    count: 5                  # fetch pool size (shuffled + trimmed to total_songs)
+    position_weight: 0.25      # lean toward the front of the playlist
+
+  # Genre-based music discovery (optional)
+  # Finds fresh tracks by genre via Spotify search
+  # TODO make these pull the actual versions of the songs not the slop compilation album
+  genres:
+    - pop
+  #   - edm
+  #   - pop rock
+    - indie pop
+    - bedroom pop
+  #   - dance pop
+
+  # Pull songs from existing playlists (optional)
+  # Find playlist IDs the same way as your target playlist above
+  genre_position_weight: 0.8   # all genre-search tracks lean toward the back
+
+  # Recently played — replaces "On Repeat" (Spotify's algorithmic playlists like
+  # Discover Weekly, Release Radar, and On Repeat are not accessible via the Web API)
+  recently_played:
+    enabled: true
+    count: 20
+    position_weight: 0.25     # familiar — lean front
+
+  playlists:
+    - name: "Greatest Hits All"
+      id: "4LC6m4z62MaCFbZdIh2qPz"
+      count: 5
+      position_weight: 0.5    # old stuff
+    # Discover Weekly / Release Radar cannot be fetched via the Spotify Web API.
+    # Use genre search above for new music discovery instead.
+
+  # How many songs to include total
+  # (The original Daily Drive had ~19 songs and ~5 podcast segments)
+  total_songs: 50
+
+  # Shuffle the songs? (true/false)
+  # TODO does this still work with weight
+  shuffle: true
+
+# --- Mix Pattern ---
+# Controls how podcasts and music are interleaved.
+# P = podcast episode, M = music track
+# The pattern repeats until all content is placed.
+# Pinned episodes (position: first) appear before the pattern starts.
+#
+# Examples:
+#   "PMMM"     → 1 podcast, 3 songs, 1 podcast, 3 songs...
+#   "PMMMM"    → 1 podcast, 4 songs, repeat...
+#   "PMMPMMM"  → 1 podcast, 2 songs, 1 podcast, 3 songs...
+#   "PM"       → alternating podcast and song
+mix_pattern: "PMMMM"
+
+# --- Schedule ---
+# When to refresh (used by the systemd timer, not the script itself)
+# Twice-daily updates: morning catches overnight podcast drops,
+# evening refreshes for the commute home
+schedule:
+  times:
+    - "05:00"            # Morning: captures overnight podcast drops
+    # - "16:00"            # Evening: refreshes for the commute home
+  timezone: "America/New_York"
