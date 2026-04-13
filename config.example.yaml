@@ -108,16 +108,18 @@ music:
   # Note: Spotify's own algorithmic playlists (Discover Weekly, Release Radar,
   # On Repeat) are NOT accessible via the Web API — use this + genre search instead.
   #
-  # Only tracks played at least `min_plays` times within `window_days` are included.
-  # Tracks that don't qualify are replaced by your 6-month top tracks (backlog_fallback)
-  # so the pool always reaches `count`.
+  # Tracks are scored by: avg_completion × log₂(play_count + 1)
+  # This rewards songs you actually finish over songs you play often but skip.
+  # Completion is estimated from the timestamp gap to the next track start.
+  # Tracks below either threshold are replaced by 6-month top tracks (backlog_fallback).
   # recently_played:
   #   enabled: true
-  #   count: 20              # target pool size
-  #   window_days: 7         # how far back to count plays (default: 7)
-  #   min_plays: 5           # minimum plays in the window to qualify (default: 1 = all)
-  #   backlog_fallback: true # fill shortfall from 6-month top tracks (default: true)
-  #   position_weight: 0.25  # 0.0 = front, 1.0 = back
+  #   count: 20               # target pool size
+  #   window_days: 7          # how far back to count plays (default: 7)
+  #   min_plays: 2            # minimum raw play count to qualify (default: 1)
+  #   min_avg_completion: 0.5 # minimum avg listen-through rate 0–1 (default: 0 = off)
+  #   backlog_fallback: true  # fill shortfall from 6-month top tracks (default: true)
+  #   position_weight: 0.25   # 0.0 = front, 1.0 = back
 
   # Pull songs from existing playlists (optional)
   # Find playlist IDs the same way as your target playlist above
