@@ -138,6 +138,12 @@ music:
 #   "PM"       → alternating podcast and song
 mix_pattern: "PMMMM"
 
+# --- Notifications ---
+# Optional: post a summary embed to Discord after each playlist update.
+# Webhook URL can also be set via DISCORD_WEBHOOK_URL in .env
+# notifications:
+#   discord_webhook: "https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN"
+
 # --- Schedule ---
 # When to refresh (used by the systemd timer, not the script itself)
 # Twice-daily updates: morning catches overnight podcast drops,
