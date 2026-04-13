@@ -688,33 +688,115 @@ async function fetchMusicTracks(spotifyApi, musicConfig) {
     }
   }
 
-  // --- Source 3: Recently played tracks ---
-  // Replaces "On Repeat" — Spotify's algorithmic playlists (Discover Weekly,
-  // Release Radar, On Repeat) are not accessible via the Web API; they use an
-  // internal backend. recently_played uses the /me/player/recently-played
-  // endpoint instead, which requires the user-read-recently-played scope
-  // (already in setup.js).
+  // --- Source 3: Recently played tracks, filtered by play frequency ---
+  // Replaces "On Repeat" — Spotify's algorithmic playlists are not accessible
+  // via the Web API. This source paginates /me/player/recently-played backwards
+  // through a configurable window, counts how many times each track appears,
+  // and only keeps tracks that meet the minimum play threshold.
+  //
+  // If not enough tracks qualify, the shortfall is backfilled from your
+  // medium_term (≈6 month) top tracks so the pool always reaches `count`.
+  //
+  // Config options:
+  //   count:            target pool size (default: 20)
+  //   window_days:      how far back to look for plays (default: 7)
+  //   min_plays:        minimum plays within the window to qualify (default: 1 = include all)
+  //   backlog_fallback: true/false — fill shortfall from 6-mo top tracks (default: true)
+  //   position_weight:  0.0 front → 1.0 back (default: 0.5)
   if (musicConfig.recently_played && musicConfig.recently_played.enabled) {
-    const count = musicConfig.recently_played.count || 20;
-    const positionWeight = musicConfig.recently_played.position_weight ?? 0.5;
-    console.log(`🎵 Fetching recently played tracks (position_weight: ${positionWeight})...`);
+    const want       = musicConfig.recently_played.count || 20;
+    const minPlays   = musicConfig.recently_played.min_plays   ?? 1;
+    const windowDays = musicConfig.recently_played.window_days ?? 7;
+    const posWeight  = musicConfig.recently_played.position_weight ?? 0.5;
+    const doBackfill = musicConfig.recently_played.backlog_fallback !== false;
+
+    console.log(`🎵 Fetching recently played (window: ${windowDays}d, min_plays: ≥${minPlays}, weight: ${posWeight})...`);
+
+    const windowStart = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+    const playCounts  = {}; // uri → play count within window
+    const trackMap    = {}; // uri → track object
+    let cursor;
+    let keepPaging = true;
 
     try {
-      const data = await spotifyApi.getMyRecentlyPlayedTracks({ limit: Math.min(count, 50) });
-      for (const item of data.body.items) {
-        const track = item.track;
-        if (track && track.uri) {
-          allTracks.push({
-            uri: track.uri,
-            name: track.name,
-            artist: track.artists?.map((a) => a.name).join(", ") || "Unknown",
-            type: "track",
-            position_weight: positionWeight,
-            source: "recently_played",
+      while (keepPaging) {
+        const opts = { limit: 50 };
+        if (cursor) opts.before = cursor;
+
+        const data = await spotifyApi.getMyRecentlyPlayedTracks(opts);
+        let anyWithinWindow = false;
+
+        for (const item of data.body.items) {
+          if (new Date(item.played_at).getTime() < windowStart) {
+            keepPaging = false; // reached the edge of the window
+            break;
+          }
+          anyWithinWindow = true;
+          const t = item.track;
+          if (!t?.uri) continue;
+          playCounts[t.uri] = (playCounts[t.uri] || 0) + 1;
+          if (!trackMap[t.uri]) {
+            trackMap[t.uri] = {
+              uri: t.uri,
+              name: t.name,
+              artist: t.artists?.map((a) => a.name).join(", ") || "Unknown",
+              type: "track",
+              position_weight: posWeight,
+              source: "recently_played",
+            };
+          }
+        }
+
+        cursor = data.body.cursors?.before;
+        if (!cursor || !anyWithinWindow) keepPaging = false;
+      }
+
+      const allRecent  = Object.keys(playCounts);
+      const qualifying = allRecent
+        .filter((uri) => playCounts[uri] >= minPlays)
+        .sort((a, b) => playCounts[b] - playCounts[a]); // most-played first
+
+      console.log(`    ${allRecent.length} unique tracks in ${windowDays}d window · ${qualifying.length} meet ≥${minPlays} play threshold`);
+      qualifying.forEach((uri) => {
+        const t = trackMap[uri];
+        console.log(`    ✅ [${playCounts[uri]}x] ${t.name} — ${t.artist}`);
+      });
+
+      allTracks.push(...qualifying.slice(0, want).map((uri) => trackMap[uri]));
+
+      // --- Backfill from 6-month top tracks if not enough tracks qualify ---
+      const filled  = Math.min(qualifying.length, want);
+      const deficit = want - filled;
+
+      if (doBackfill && deficit > 0) {
+        console.log(`    📚 ${filled} qualified — backfilling ${deficit} from medium_term top tracks (≈6 months)...`);
+        try {
+          const backlogData = await spotifyApi.getMyTopTracks({
+            limit: Math.min(deficit * 3, 50), // fetch 3× to have room to dedup
+            time_range: "medium_term",
           });
+          const existingUris = new Set(allTracks.map((t) => t.uri));
+          let added = 0;
+          for (const track of backlogData.body.items) {
+            if (added >= deficit) break;
+            if (existingUris.has(track.uri)) continue;
+            allTracks.push({
+              uri: track.uri,
+              name: track.name,
+              artist: track.artists?.map((a) => a.name).join(", ") || "Unknown",
+              type: "track",
+              position_weight: posWeight,
+              source: "top_tracks:medium_term",
+            });
+            existingUris.add(track.uri);
+            added++;
+            console.log(`    📚 Backfill: ${track.name} — ${track.artists?.map((a) => a.name).join(", ")}`);
+          }
+          console.log(`    📚 Added ${added} backfill track${added !== 1 ? "s" : ""}`);
+        } catch (err) {
+          console.error(`    ⚠️  Backfill fetch failed: ${err.message}`);
         }
       }
-      console.log(`    Found ${data.body.items.length} recently played tracks`);
     } catch (err) {
       console.error(`    ⚠️  Failed to fetch recently played: ${err.message}`);
     }
@@ -984,10 +1066,11 @@ async function sendDiscordNotification(mixed, mode, mixPattern, webhookUrl, logL
     sourceCounts[key] = (sourceCounts[key] || 0) + 1;
   }
   const sourceLabel = (src) => {
-    if (src === "top_tracks")        return "Top Tracks";
-    if (src === "recently_played")   return "Recent Plays";
-    if (src.startsWith("playlist:")) return src.slice("playlist:".length);
-    if (src.startsWith("genre:"))    return `${src.slice("genre:".length)} (discovery)`;
+    if (src === "top_tracks")              return "Top Tracks";
+    if (src === "top_tracks:medium_term")  return "6-mo Backlog";
+    if (src === "recently_played")         return "Recent Plays";
+    if (src.startsWith("playlist:"))       return src.slice("playlist:".length);
+    if (src.startsWith("genre:"))          return `${src.slice("genre:".length)} (discovery)`;
     return src;
   };
   const musicLines = Object.entries(sourceCounts)
@@ -1067,10 +1150,11 @@ async function updatePlaylistDescription(spotifyApi, playlistId, mixed) {
   }
 
   const sourceLabel = (src) => {
-    if (src === "top_tracks")      return "Top Tracks";
-    if (src === "recently_played") return "Recent";
-    if (src.startsWith("playlist:")) return src.slice("playlist:".length);
-    if (src.startsWith("genre:"))   return `${src.slice("genre:".length)} disc.`;
+    if (src === "top_tracks")              return "Top Tracks";
+    if (src === "top_tracks:medium_term")  return "6-mo Backlog";
+    if (src === "recently_played")         return "Recent";
+    if (src.startsWith("playlist:"))       return src.slice("playlist:".length);
+    if (src.startsWith("genre:"))          return `${src.slice("genre:".length)} disc.`;
     return src;
   };
 

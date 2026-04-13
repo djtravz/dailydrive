@@ -107,9 +107,16 @@ music:
   # Recently played tracks — good "On Repeat" equivalent.
   # Note: Spotify's own algorithmic playlists (Discover Weekly, Release Radar,
   # On Repeat) are NOT accessible via the Web API — use this + genre search instead.
+  #
+  # Only tracks played at least `min_plays` times within `window_days` are included.
+  # Tracks that don't qualify are replaced by your 6-month top tracks (backlog_fallback)
+  # so the pool always reaches `count`.
   # recently_played:
   #   enabled: true
-  #   count: 20              # max 50 (Spotify API limit)
+  #   count: 20              # target pool size
+  #   window_days: 7         # how far back to count plays (default: 7)
+  #   min_plays: 5           # minimum plays in the window to qualify (default: 1 = all)
+  #   backlog_fallback: true # fill shortfall from 6-month top tracks (default: true)
   #   position_weight: 0.25  # 0.0 = front, 1.0 = back
 
   # Pull songs from existing playlists (optional)
