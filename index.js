@@ -688,33 +688,162 @@ async function fetchMusicTracks(spotifyApi, musicConfig) {
     }
   }
 
-  // --- Source 3: Recently played tracks ---
-  // Replaces "On Repeat" — Spotify's algorithmic playlists (Discover Weekly,
-  // Release Radar, On Repeat) are not accessible via the Web API; they use an
-  // internal backend. recently_played uses the /me/player/recently-played
-  // endpoint instead, which requires the user-read-recently-played scope
-  // (already in setup.js).
+  // --- Source 3: Recently played tracks, scored by completion × frequency ---
+  // Replaces "On Repeat" — Spotify's algorithmic playlists are not accessible
+  // via the Web API.
+  //
+  // Play completion is ESTIMATED from timestamps: the elapsed time between when
+  // a track started playing and when the next track started is divided by the
+  // track's duration_ms. If the gap is >2× the duration (user paused Spotify),
+  // we assume the track finished and count it as 1.0. The most recent event
+  // has no successor, so it is also treated as completed.
+  //
+  // Final ranking score:
+  //   score = avg_completion × log₂(play_count + 1)
+  //
+  // This rewards tracks you consistently finish over tracks you play often
+  // but skip. Play count still matters via the log term, but with diminishing
+  // returns — playing a song 8× counts for less than 2× a 4-play song.
+  //
+  // Config options:
+  //   count:               target pool size (default: 20)
+  //   window_days:         how far back to look (default: 7)
+  //   min_plays:           minimum raw play count gate (default: 1)
+  //   min_avg_completion:  minimum avg completion 0–1 to qualify (default: 0)
+  //   backlog_fallback:    fill shortfall from 6-mo top tracks (default: true)
+  //   position_weight:     0.0 front → 1.0 back (default: 0.5)
   if (musicConfig.recently_played && musicConfig.recently_played.enabled) {
-    const count = musicConfig.recently_played.count || 20;
-    const positionWeight = musicConfig.recently_played.position_weight ?? 0.5;
-    console.log(`🎵 Fetching recently played tracks (position_weight: ${positionWeight})...`);
+    const want             = musicConfig.recently_played.count              || 20;
+    const minPlays         = musicConfig.recently_played.min_plays          ?? 1;
+    const minAvgCompletion = musicConfig.recently_played.min_avg_completion ?? 0;
+    const windowDays       = musicConfig.recently_played.window_days        ?? 7;
+    const posWeight        = musicConfig.recently_played.position_weight    ?? 0.5;
+    const doBackfill       = musicConfig.recently_played.backlog_fallback   !== false;
+
+    console.log(`🎵 Fetching recently played (window: ${windowDays}d, min_plays: ≥${minPlays}, min_completion: ≥${Math.round(minAvgCompletion * 100)}%, weight: ${posWeight})...`);
+
+    const windowStart = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+
+    // Collect all play events newest-first across paginated batches
+    const allEvents = []; // [{ uri, playedAt, durationMs, track }]
+    let cursor;
+    let keepPaging = true;
 
     try {
-      const data = await spotifyApi.getMyRecentlyPlayedTracks({ limit: Math.min(count, 50) });
-      for (const item of data.body.items) {
-        const track = item.track;
-        if (track && track.uri) {
-          allTracks.push({
-            uri: track.uri,
-            name: track.name,
-            artist: track.artists?.map((a) => a.name).join(", ") || "Unknown",
-            type: "track",
-            position_weight: positionWeight,
-            source: "recently_played",
+      while (keepPaging) {
+        const opts = { limit: 50 };
+        if (cursor) opts.before = cursor;
+
+        const data = await spotifyApi.getMyRecentlyPlayedTracks(opts);
+        let anyWithinWindow = false;
+
+        for (const item of data.body.items) {
+          const playedAt = new Date(item.played_at).getTime();
+          if (playedAt < windowStart) { keepPaging = false; break; }
+          anyWithinWindow = true;
+          const t = item.track;
+          if (!t?.uri) continue;
+          allEvents.push({
+            uri:        t.uri,
+            playedAt,
+            durationMs: t.duration_ms || 210000, // fallback: 3.5 min
+            track:      t,
           });
         }
+
+        cursor = data.body.cursors?.before;
+        if (!cursor || !anyWithinWindow) keepPaging = false;
       }
-      console.log(`    Found ${data.body.items.length} recently played tracks`);
+
+      // --- Estimate completion for each play event ---
+      // allEvents[0] = most recent, allEvents[N-1] = oldest.
+      // The track that played AFTER event[i] is event[i-1] (more recent).
+      // elapsed = event[i-1].playedAt - event[i].playedAt
+      // event[0] has no successor → treat as completed (1.0)
+      const trackStats = {}; // uri → { count, completionSum, track }
+
+      for (let i = 0; i < allEvents.length; i++) {
+        const ev = allEvents[i];
+        const nextPlayedAt = i > 0 ? allEvents[i - 1].playedAt : Date.now();
+        const elapsed      = nextPlayedAt - ev.playedAt;
+
+        // Long gap before next track (>2× duration) → user paused after finishing
+        const completion = elapsed > ev.durationMs * 2
+          ? 1.0
+          : Math.min(elapsed / ev.durationMs, 1.0);
+
+        if (!trackStats[ev.uri]) {
+          trackStats[ev.uri] = { count: 0, completionSum: 0, track: ev.track };
+        }
+        trackStats[ev.uri].count++;
+        trackStats[ev.uri].completionSum += completion;
+      }
+
+      // --- Score, filter, sort ---
+      const scored = Object.entries(trackStats).map(([uri, s]) => {
+        const avgCompletion = s.completionSum / s.count;
+        // log2 gives diminishing returns on raw play count
+        const score = avgCompletion * Math.log2(s.count + 1);
+        return { uri, count: s.count, avgCompletion, score, track: s.track };
+      });
+
+      const qualifying = scored.filter(
+        (s) => s.count >= minPlays && s.avgCompletion >= minAvgCompletion
+      ).sort((a, b) => b.score - a.score);
+
+      const allUnique = Object.keys(trackStats).length;
+      console.log(`    ${allUnique} unique tracks in ${windowDays}d window · ${qualifying.length} qualify (≥${minPlays} plays, ≥${Math.round(minAvgCompletion * 100)}% completion)`);
+
+      for (const s of qualifying) {
+        const pct   = Math.round(s.avgCompletion * 100);
+        const label = s.avgCompletion >= 0.8 ? "✅" : s.avgCompletion >= 0.5 ? "〽️ " : "⏭️ ";
+        console.log(`    ${label} [${s.count}x @ ${pct}% → score ${s.score.toFixed(2)}] ${s.track.name} — ${s.track.artists?.map((a) => a.name).join(", ")}`);
+      }
+
+      for (const s of qualifying.slice(0, want)) {
+        allTracks.push({
+          uri:            s.uri,
+          name:           s.track.name,
+          artist:         s.track.artists?.map((a) => a.name).join(", ") || "Unknown",
+          type:           "track",
+          position_weight: posWeight,
+          source:         "recently_played",
+        });
+      }
+
+      // --- Backfill from 6-month top tracks if not enough qualify ---
+      const filled  = Math.min(qualifying.length, want);
+      const deficit = want - filled;
+
+      if (doBackfill && deficit > 0) {
+        console.log(`    📚 ${filled} qualified — backfilling ${deficit} from medium_term top tracks (≈6 months)...`);
+        try {
+          const backlogData = await spotifyApi.getMyTopTracks({
+            limit: Math.min(deficit * 3, 50),
+            time_range: "medium_term",
+          });
+          const existingUris = new Set(allTracks.map((t) => t.uri));
+          let added = 0;
+          for (const track of backlogData.body.items) {
+            if (added >= deficit) break;
+            if (existingUris.has(track.uri)) continue;
+            allTracks.push({
+              uri:            track.uri,
+              name:           track.name,
+              artist:         track.artists?.map((a) => a.name).join(", ") || "Unknown",
+              type:           "track",
+              position_weight: posWeight,
+              source:         "top_tracks:medium_term",
+            });
+            existingUris.add(track.uri);
+            added++;
+            console.log(`    📚 Backfill: ${track.name} — ${track.artists?.map((a) => a.name).join(", ")}`);
+          }
+          console.log(`    📚 Added ${added} backfill track${added !== 1 ? "s" : ""}`);
+        } catch (err) {
+          console.error(`    ⚠️  Backfill fetch failed: ${err.message}`);
+        }
+      }
     } catch (err) {
       console.error(`    ⚠️  Failed to fetch recently played: ${err.message}`);
     }
@@ -984,10 +1113,11 @@ async function sendDiscordNotification(mixed, mode, mixPattern, webhookUrl, logL
     sourceCounts[key] = (sourceCounts[key] || 0) + 1;
   }
   const sourceLabel = (src) => {
-    if (src === "top_tracks")        return "Top Tracks";
-    if (src === "recently_played")   return "Recent Plays";
-    if (src.startsWith("playlist:")) return src.slice("playlist:".length);
-    if (src.startsWith("genre:"))    return `${src.slice("genre:".length)} (discovery)`;
+    if (src === "top_tracks")              return "Top Tracks";
+    if (src === "top_tracks:medium_term")  return "6-mo Backlog";
+    if (src === "recently_played")         return "Recent Plays";
+    if (src.startsWith("playlist:"))       return src.slice("playlist:".length);
+    if (src.startsWith("genre:"))          return `${src.slice("genre:".length)} (discovery)`;
     return src;
   };
   const musicLines = Object.entries(sourceCounts)
@@ -1067,10 +1197,11 @@ async function updatePlaylistDescription(spotifyApi, playlistId, mixed) {
   }
 
   const sourceLabel = (src) => {
-    if (src === "top_tracks")      return "Top Tracks";
-    if (src === "recently_played") return "Recent";
-    if (src.startsWith("playlist:")) return src.slice("playlist:".length);
-    if (src.startsWith("genre:"))   return `${src.slice("genre:".length)} disc.`;
+    if (src === "top_tracks")              return "Top Tracks";
+    if (src === "top_tracks:medium_term")  return "6-mo Backlog";
+    if (src === "recently_played")         return "Recent";
+    if (src.startsWith("playlist:"))       return src.slice("playlist:".length);
+    if (src.startsWith("genre:"))          return `${src.slice("genre:".length)} disc.`;
     return src;
   };
 
