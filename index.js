@@ -688,41 +688,51 @@ async function fetchMusicTracks(spotifyApi, musicConfig) {
     }
   }
 
-  // --- Source 3: Recently played tracks, scored by completion × frequency ---
+  // --- Source 3: Recently played, scored by time-decayed completion ---
   // Replaces "On Repeat" — Spotify's algorithmic playlists are not accessible
   // via the Web API.
   //
-  // Play completion is ESTIMATED from timestamps: the elapsed time between when
-  // a track started playing and when the next track started is divided by the
-  // track's duration_ms. If the gap is >2× the duration (user paused Spotify),
-  // we assume the track finished and count it as 1.0. The most recent event
-  // has no successor, so it is also treated as completed.
+  // The goal is to surface songs you are currently "in a phase with" — including
+  // tracks you played heavily 2–3 weeks ago that haven't been replaced yet —
+  // while not rewarding songs you only played once or twice very recently.
   //
-  // Final ranking score:
-  //   score = avg_completion × log₂(play_count + 1)
+  // HOW SCORING WORKS
+  // -----------------
+  // Each play event contributes a decayed weight to its track's total score:
   //
-  // This rewards tracks you consistently finish over tracks you play often
-  // but skip. Play count still matters via the log term, but with diminishing
-  // returns — playing a song 8× counts for less than 2× a 4-play song.
+  //   play_weight = completion × 0.5^(days_ago / half_life_days)
+  //   track_score = Σ play_weight  (summed across all plays in the window)
+  //
+  // Completion is estimated from the timestamp gap to the next track start.
+  // The decay halves every `decay_half_life_days` days, so plays from longer
+  // ago still count — they just count for less.
+  //
+  // Example with half_life = 14:
+  //   Song A: 8 plays spread over the last 3 weeks → score ≈ 4.2
+  //   Song B: 2 plays yesterday                    → score ≈ 1.8
+  //   → A wins even though it hasn't been touched this week.
   //
   // Config options:
-  //   count:               target pool size (default: 20)
-  //   window_days:         how far back to look (default: 7)
-  //   min_plays:           minimum raw play count gate (default: 1)
-  //   min_avg_completion:  minimum avg completion 0–1 to qualify (default: 0)
-  //   backlog_fallback:    fill shortfall from 6-mo top tracks (default: true)
-  //   position_weight:     0.0 front → 1.0 back (default: 0.5)
+  //   count:                 target pool size (default: 20)
+  //   window_days:           how far back to look (default: 28 — 4 weeks of context)
+  //   decay_half_life_days:  plays halve in weight every N days (default: 14)
+  //   min_plays:             sanity gate: must appear at least N times (default: 1)
+  //   min_score:             minimum decay-weighted score to qualify (default: 0)
+  //   backlog_fallback:      fill shortfall from 6-mo top tracks (default: true)
+  //   position_weight:       0.0 front → 1.0 back (default: 0.5)
   if (musicConfig.recently_played && musicConfig.recently_played.enabled) {
-    const want             = musicConfig.recently_played.count              || 20;
-    const minPlays         = musicConfig.recently_played.min_plays          ?? 1;
-    const minAvgCompletion = musicConfig.recently_played.min_avg_completion ?? 0;
-    const windowDays       = musicConfig.recently_played.window_days        ?? 7;
-    const posWeight        = musicConfig.recently_played.position_weight    ?? 0.5;
-    const doBackfill       = musicConfig.recently_played.backlog_fallback   !== false;
+    const want       = musicConfig.recently_played.count                || 20;
+    const minPlays   = musicConfig.recently_played.min_plays            ?? 1;
+    const minScore   = musicConfig.recently_played.min_score            ?? 0;
+    const windowDays = musicConfig.recently_played.window_days          ?? 28;
+    const halfLife   = musicConfig.recently_played.decay_half_life_days ?? 14;
+    const posWeight  = musicConfig.recently_played.position_weight      ?? 0.5;
+    const doBackfill = musicConfig.recently_played.backlog_fallback     !== false;
 
-    console.log(`🎵 Fetching recently played (window: ${windowDays}d, min_plays: ≥${minPlays}, min_completion: ≥${Math.round(minAvgCompletion * 100)}%, weight: ${posWeight})...`);
+    console.log(`🎵 Fetching recently played (window: ${windowDays}d, half-life: ${halfLife}d, min_plays: ${minPlays}, weight: ${posWeight})...`);
 
     const windowStart = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+    const MS_PER_DAY  = 24 * 60 * 60 * 1000;
 
     // Collect all play events newest-first across paginated batches
     const allEvents = []; // [{ uri, playedAt, durationMs, track }]
@@ -743,76 +753,67 @@ async function fetchMusicTracks(spotifyApi, musicConfig) {
           anyWithinWindow = true;
           const t = item.track;
           if (!t?.uri) continue;
-          allEvents.push({
-            uri:        t.uri,
-            playedAt,
-            durationMs: t.duration_ms || 210000, // fallback: 3.5 min
-            track:      t,
-          });
+          allEvents.push({ uri: t.uri, playedAt, durationMs: t.duration_ms || 210000, track: t });
         }
 
         cursor = data.body.cursors?.before;
         if (!cursor || !anyWithinWindow) keepPaging = false;
       }
 
-      // --- Estimate completion for each play event ---
-      // allEvents[0] = most recent, allEvents[N-1] = oldest.
-      // The track that played AFTER event[i] is event[i-1] (more recent).
-      // elapsed = event[i-1].playedAt - event[i].playedAt
-      // event[0] has no successor → treat as completed (1.0)
-      const trackStats = {}; // uri → { count, completionSum, track }
+      // --- Score each play event with time decay ---
+      // allEvents[0] = most recent. event[i-1] is the track played AFTER event[i].
+      const trackStats = {}; // uri → { count, score, lastPlayedAt, track }
 
       for (let i = 0; i < allEvents.length; i++) {
-        const ev = allEvents[i];
+        const ev  = allEvents[i];
+
+        // Estimate how much of this track was listened to
         const nextPlayedAt = i > 0 ? allEvents[i - 1].playedAt : Date.now();
         const elapsed      = nextPlayedAt - ev.playedAt;
-
-        // Long gap before next track (>2× duration) → user paused after finishing
-        const completion = elapsed > ev.durationMs * 2
+        const completion   = elapsed > ev.durationMs * 2
           ? 1.0
           : Math.min(elapsed / ev.durationMs, 1.0);
 
+        // Exponential decay: plays from longer ago contribute less
+        const daysAgo     = (Date.now() - ev.playedAt) / MS_PER_DAY;
+        const decayFactor = Math.pow(0.5, daysAgo / halfLife);
+        const playWeight  = completion * decayFactor;
+
         if (!trackStats[ev.uri]) {
-          trackStats[ev.uri] = { count: 0, completionSum: 0, track: ev.track };
+          trackStats[ev.uri] = { count: 0, score: 0, lastPlayedAt: ev.playedAt, track: ev.track };
         }
         trackStats[ev.uri].count++;
-        trackStats[ev.uri].completionSum += completion;
+        trackStats[ev.uri].score += playWeight;
+        // lastPlayedAt stays as the first hit (events are newest-first)
       }
 
-      // --- Score, filter, sort ---
-      const scored = Object.entries(trackStats).map(([uri, s]) => {
-        const avgCompletion = s.completionSum / s.count;
-        // log2 gives diminishing returns on raw play count
-        const score = avgCompletion * Math.log2(s.count + 1);
-        return { uri, count: s.count, avgCompletion, score, track: s.track };
-      });
-
-      const qualifying = scored.filter(
-        (s) => s.count >= minPlays && s.avgCompletion >= minAvgCompletion
-      ).sort((a, b) => b.score - a.score);
+      // --- Filter and rank by score ---
+      const scored = Object.values(trackStats)
+        .filter((s) => s.count >= minPlays && s.score >= minScore)
+        .sort((a, b) => b.score - a.score);
 
       const allUnique = Object.keys(trackStats).length;
-      console.log(`    ${allUnique} unique tracks in ${windowDays}d window · ${qualifying.length} qualify (≥${minPlays} plays, ≥${Math.round(minAvgCompletion * 100)}% completion)`);
+      console.log(`    ${allEvents.length} plays · ${allUnique} unique tracks in ${windowDays}d window · ${scored.length} qualify`);
 
-      for (const s of qualifying) {
-        const pct   = Math.round(s.avgCompletion * 100);
-        const label = s.avgCompletion >= 0.8 ? "✅" : s.avgCompletion >= 0.5 ? "〽️ " : "⏭️ ";
-        console.log(`    ${label} [${s.count}x @ ${pct}% → score ${s.score.toFixed(2)}] ${s.track.name} — ${s.track.artists?.map((a) => a.name).join(", ")}`);
+      for (const s of scored) {
+        const daysAgo = Math.round((Date.now() - s.lastPlayedAt) / MS_PER_DAY);
+        const recency = daysAgo === 0 ? "today" : daysAgo === 1 ? "yesterday" : `${daysAgo}d ago`;
+        console.log(`    ✅ [${s.count}x · last ${recency} · score ${s.score.toFixed(2)}] ${s.track.name} — ${s.track.artists?.map((a) => a.name).join(", ")}`);
       }
 
-      for (const s of qualifying.slice(0, want)) {
+      for (const s of scored.slice(0, want)) {
         allTracks.push({
-          uri:            s.uri,
-          name:           s.track.name,
-          artist:         s.track.artists?.map((a) => a.name).join(", ") || "Unknown",
-          type:           "track",
+          uri:             s.uri,
+          name:            s.track.name,
+          artist:          s.track.artists?.map((a) => a.name).join(", ") || "Unknown",
+          type:            "track",
           position_weight: posWeight,
-          source:         "recently_played",
+          source:          "recently_played",
         });
       }
 
       // --- Backfill from 6-month top tracks if not enough qualify ---
-      const filled  = Math.min(qualifying.length, want);
+      const filled  = Math.min(scored.length, want);
       const deficit = want - filled;
 
       if (doBackfill && deficit > 0) {
@@ -828,12 +829,12 @@ async function fetchMusicTracks(spotifyApi, musicConfig) {
             if (added >= deficit) break;
             if (existingUris.has(track.uri)) continue;
             allTracks.push({
-              uri:            track.uri,
-              name:           track.name,
-              artist:         track.artists?.map((a) => a.name).join(", ") || "Unknown",
-              type:           "track",
+              uri:             track.uri,
+              name:            track.name,
+              artist:          track.artists?.map((a) => a.name).join(", ") || "Unknown",
+              type:            "track",
               position_weight: posWeight,
-              source:         "top_tracks:medium_term",
+              source:          "top_tracks:medium_term",
             });
             existingUris.add(track.uri);
             added++;
