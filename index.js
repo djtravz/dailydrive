@@ -261,8 +261,11 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
 
     // ---------------------------------------------------------------
     // Normal fetch.
-    // With backup: primary only counts if it was published today AND
-    //              is unlistened. Otherwise backup shows are tried.
+    // With backup: primary qualifies if unlistened (any date).
+    //   Backup fires only when the most recent primary episode is
+    //   already listened to. This means a show that publishes at
+    //   5:30am will still appear in the 4am playlist using yesterday's
+    //   episode, rather than falling to backup before it even publishes.
     // Without backup: always include (original behavior).
     // ---------------------------------------------------------------
     console.log(`🎙️  Fetching ${count} episode(s) from: ${podcast.name}`);
@@ -284,16 +287,17 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
           const isSunday = new Date(episode.release_date).getUTCDay() === 0;
           const blockedBySunday = podcast.skip_sunday && isSunday;
 
-          if (isFresh && !listened && !blockedBySunday) {
+          if (!listened && !blockedBySunday) {
             primaryQualifies = true;
+            const freshTag = isFresh ? "fresh today" : `from ${episode.release_date}`;
             episodes.push({ uri: episode.uri, name: episode.name, show: podcast.name, type: "episode", position: podcast.position || null });
-            console.log(`    📌 ${episode.name} (fresh today)`);
+            console.log(`    📌 ${episode.name} (${freshTag})`);
           } else {
             const reason = blockedBySunday
               ? `Sunday episode — handled by sunday_only slot`
-              : !isFresh ? `published ${episode.release_date}, not today`
-              : fullyPlayed ? "fully played" : `${Math.round(remainingMs / 60000)}min remaining`;
-            console.log(`    ⏭️  Primary not used (${reason}): ${episode.name}`);
+              : fullyPlayed ? "fully played"
+              : `${Math.round(remainingMs / 60000)}min remaining`;
+            console.log(`    ⏭️  Primary not used (${reason}): ${episode.name} [${episode.release_date}]`);
           }
         } else {
           episodes.push({ uri: episode.uri, name: episode.name, show: podcast.name, type: "episode", position: podcast.position || null });
