@@ -261,11 +261,8 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
 
     // ---------------------------------------------------------------
     // Normal fetch.
-    // With backup: primary qualifies if unlistened (any date).
-    //   Backup fires only when the most recent primary episode is
-    //   already listened to. This means a show that publishes at
-    //   5:30am will still appear in the 4am playlist using yesterday's
-    //   episode, rather than falling to backup before it even publishes.
+    // With backup: primary only counts if it was published today AND
+    //              is unlistened. Otherwise backup shows are tried.
     // Without backup: always include (original behavior).
     // ---------------------------------------------------------------
     console.log(`🎙️  Fetching ${count} episode(s) from: ${podcast.name}`);
@@ -287,7 +284,7 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
           const isSunday = new Date(episode.release_date).getUTCDay() === 0;
           const blockedBySunday = podcast.skip_sunday && isSunday;
 
-          if (!listened && !blockedBySunday) {
+          if (isFresh && !listened && !blockedBySunday) {
             primaryQualifies = true;
             const freshTag = isFresh ? "fresh today" : `from ${episode.release_date}`;
             episodes.push({ uri: episode.uri, name: episode.name, show: podcast.name, type: "episode", position: podcast.position || null });
