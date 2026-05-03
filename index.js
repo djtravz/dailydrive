@@ -781,7 +781,7 @@ async function fetchMusicTracks(spotifyApi, musicConfig) {
         const playWeight  = completion * decayFactor;
 
         if (!trackStats[ev.uri]) {
-          trackStats[ev.uri] = { count: 0, score: 0, lastPlayedAt: ev.playedAt, track: ev.track };
+          trackStats[ev.uri] = { uri: ev.uri, count: 0, score: 0, lastPlayedAt: ev.playedAt, track: ev.track };
         }
         trackStats[ev.uri].count++;
         trackStats[ev.uri].score += playWeight;
