@@ -1226,7 +1226,7 @@ async function updatePlaylistDescription(spotifyApi, playlistId, mixed) {
 
   const accessToken = spotifyApi.getAccessToken();
   const res = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}`, {
-    method: "PATCH",
+    method: "PUT",
     headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
     body: JSON.stringify({ description }),
   });
