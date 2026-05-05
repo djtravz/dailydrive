@@ -44,6 +44,7 @@ config.local.*
 state.json
 *.state
 cursors.json
+listening-history.json
 
 # --- Node.js ---
 node_modules/

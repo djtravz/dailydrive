@@ -27,9 +27,10 @@ if (fs.existsSync(".env")) {
 }
 
 // --- File paths used by the script ---
-const TOKEN_FILE = ".spotify-token.json";  // Stores your Spotify OAuth tokens (created by setup.js)
-const CONFIG_FILE = "config.yaml";         // Your configuration (podcasts, music, schedule, etc.)
-const STATE_FILE = "state.json";           // Caches last run's episode URIs to detect changes
+const TOKEN_FILE   = ".spotify-token.json";      // Stores your Spotify OAuth tokens (created by setup.js)
+const CONFIG_FILE  = "config.yaml";              // Your configuration (podcasts, music, schedule, etc.)
+const STATE_FILE   = "state.json";               // Caches last run's episode URIs to detect changes
+const HISTORY_FILE = "listening-history.json";   // Tracks every song heard — used to filter discovery tracks
 
 // Check command-line flags
 const DRY_RUN = process.argv.includes("--dry-run");       // Shows what would happen without changing the playlist
@@ -109,6 +110,72 @@ function loadState() {
  */
 function saveState(state) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+/**
+ * Loads the listening history file. Returns a safe default if missing or corrupt.
+ * The history is used to filter discovery tracks to songs never heard before.
+ */
+function loadListeningHistory() {
+  if (!fs.existsSync(HISTORY_FILE)) {
+    return { last_incremental_update: null, uris: [], names: [] };
+  }
+  try {
+    return JSON.parse(fs.readFileSync(HISTORY_FILE, "utf8"));
+  } catch {
+    return { last_incremental_update: null, uris: [], names: [] };
+  }
+}
+
+/**
+ * Saves the listening history file.
+ */
+function saveListeningHistory(history) {
+  fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
+}
+
+/**
+ * Normalizes an artist+track pair into a lowercase key for name-based matching.
+ * Used when the Spotify export didn't include URIs (standard history format).
+ */
+function normalizeHistoryName(artist, track) {
+  return `${artist}|${track}`.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Appends recently played tracks to the listening history file.
+ * Called at the end of every non-dry-run so the exclusion list stays current.
+ * Uses last_incremental_update as a timestamp cursor to avoid redundant work.
+ */
+async function updateListeningHistory(spotifyApi, history) {
+  const afterMs      = history.last_incremental_update
+    ? new Date(history.last_incremental_update).getTime()
+    : 0;
+  const existingUris = new Set(history.uris || []);
+  let   newCount     = 0;
+
+  try {
+    // 50 is the API max per call. Sufficient for daily runs.
+    const data = await spotifyApi.getMyRecentlyPlayedTracks({ limit: 50 });
+
+    for (const item of data.body.items) {
+      const playedAt = new Date(item.played_at).getTime();
+      if (playedAt <= afterMs) continue; // already captured in a previous run
+      const uri = item.track?.uri;
+      if (uri && uri.startsWith("spotify:track:") && !existingUris.has(uri)) {
+        existingUris.add(uri);
+        newCount++;
+      }
+    }
+  } catch (err) {
+    console.error(`⚠️  Could not update listening history: ${err.message}`);
+    return;
+  }
+
+  history.uris                   = Array.from(existingUris);
+  history.last_incremental_update = new Date().toISOString();
+  saveListeningHistory(history);
+  console.log(`📚 History: +${newCount} new track${newCount !== 1 ? "s" : ""} (${existingUris.size.toLocaleString()} total heard)`);
 }
 
 /**
@@ -863,7 +930,7 @@ async function fetchMusicTracks(spotifyApi, musicConfig) {
  * positionWeight controls where these tracks land in the final playlist
  * (0.0 = front, 1.0 = back). Defaults to 0.75 so discovery sits toward the end.
  */
-async function fetchGenreTracks(spotifyApi, genres, count, positionWeight = 0.75) {
+async function fetchGenreTracks(spotifyApi, genres, count, positionWeight = 0.75, heardUris = null, heardNames = null) {
   const tracks = [];
   const perGenre = Math.ceil(count / genres.length);
 
@@ -875,11 +942,30 @@ async function fetchGenreTracks(spotifyApi, genres, count, positionWeight = 0.75
         market: "US",
       });
 
-      // Filter out compilation albums (where weird multi-artist versions live),
-      // then sort by popularity so we get the well-known version of a song.
-      const filtered = data.body.tracks.items
-        .filter((t) => t.album?.album_type !== "compilation")
-        .sort((a, b) => b.popularity - a.popularity);
+      const raw = data.body.tracks.items;
+      // Filter out compilations, then heard tracks, then sort by popularity
+      const notCompilation = raw.filter((t) => t.album?.album_type !== "compilation");
+      const notHeard = heardUris || heardNames
+        ? notCompilation.filter((t) => {
+            if (heardUris?.has(t.uri)) return false;
+            if (heardNames) {
+              const key = normalizeHistoryName(
+                t.artists?.[0]?.name || "", t.name
+              );
+              if (heardNames.has(key)) return false;
+            }
+            return true;
+          })
+        : notCompilation;
+
+      const filtered = notHeard.sort((a, b) => b.popularity - a.popularity);
+
+      const compilationCount = raw.length - notCompilation.length;
+      const heardCount       = notCompilation.length - notHeard.length;
+      const filterNote = [
+        compilationCount > 0 ? `${compilationCount} compilation(s)` : null,
+        heardCount       > 0 ? `${heardCount} already heard`        : null,
+      ].filter(Boolean).join(", ");
 
       for (const track of filtered) {
         tracks.push({
@@ -891,7 +977,7 @@ async function fetchGenreTracks(spotifyApi, genres, count, positionWeight = 0.75
           source: `genre:${genre}`,
         });
       }
-      console.log(`    Found ${filtered.length} tracks (${data.body.tracks.items.length - filtered.length} compilation(s) filtered)`);
+      console.log(`    Found ${filtered.length} unheard tracks${filterNote ? ` (filtered: ${filterNote})` : ""}`);
     } catch (err) {
       console.error(`    ⚠️  Failed to search genre ${genre}: ${err.message}`);
     }
@@ -1246,9 +1332,10 @@ async function main() {
   const mode = PODCAST_ONLY ? "podcast-only" : "full";
   console.log(`\n🚗 Daily Drive — ${PODCAST_ONLY ? "Hourly podcast refresh" : "Full playlist rebuild"}...\n`);
 
-  // Step 1: Load configuration and authentication token
-  const config = loadConfig();
-  const token = loadToken();
+  // Step 1: Load configuration, authentication token, and listening history
+  const config  = loadConfig();
+  const token   = loadToken();
+  const history = loadListeningHistory();
 
   // Step 2: Create Spotify API client with your app credentials
   // Credentials come from .env (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET)
@@ -1311,12 +1398,12 @@ async function main() {
       // No saved music — fall back to a full music fetch
       // This happens on the very first run, or if state.json was deleted
       console.log("⚠️  No saved music tracks found — falling back to full music fetch");
-      tracks = await fetchAllMusicTracks(spotifyApi, config);
+      tracks = await fetchAllMusicTracks(spotifyApi, config, history);
     }
   } else {
     // --- Full refresh mode (daily) ---
     // Fetch fresh music from all sources (top tracks, playlists, genre discovery)
-    tracks = await fetchAllMusicTracks(spotifyApi, config);
+    tracks = await fetchAllMusicTracks(spotifyApi, config, history);
   }
 
   if (episodes.length === 0 && tracks.length === 0) {
@@ -1406,6 +1493,10 @@ async function main() {
 
     saveState(newState);
     console.log("💾 State saved to state.json");
+
+    // Append recently played tracks to the listening history so future
+    // discovery runs exclude anything heard since the last import.
+    await updateListeningHistory(spotifyApi, history);
   }
 }
 
@@ -1414,7 +1505,7 @@ async function main() {
  * Used by full refresh mode, and as a fallback for podcast-only mode
  * when no saved tracks exist yet.
  */
-async function fetchAllMusicTracks(spotifyApi, config) {
+async function fetchAllMusicTracks(spotifyApi, config, history = null) {
   const musicConfig = config.music || {};
   const totalSongs = musicConfig.total_songs || 15;
   const hasGenres = musicConfig.genres && musicConfig.genres.length > 0;
@@ -1434,11 +1525,19 @@ async function fetchAllMusicTracks(spotifyApi, config) {
   // Fetch discovery tracks and pass through the configured position weight
   if (hasGenres && discoveryCount > 0) {
     const genrePositionWeight = musicConfig.genre_position_weight ?? 0.75;
+    // Build heard sets from history so discovery tracks are truly new
+    const heardUris  = history ? new Set(history.uris  || []) : null;
+    const heardNames = history ? new Set(history.names || []) : null;
+    if (history) {
+      console.log(`🎵 Discovery filter: ${(heardUris?.size || 0).toLocaleString()} heard URIs + ${(heardNames?.size || 0).toLocaleString()} heard names loaded`);
+    }
     const genreTracks = await fetchGenreTracks(
       spotifyApi,
       musicConfig.genres,
       discoveryCount,
-      genrePositionWeight
+      genrePositionWeight,
+      heardUris,
+      heardNames
     );
 
     const familiarUris = new Set(tracks.map((t) => t.uri));

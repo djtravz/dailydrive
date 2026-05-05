@@ -8,7 +8,8 @@
     "start": "node index.js",
     "test": "node index.js --dry-run",
     "taste": "node taste-profile.js",
-    "taste:google": "node taste-profile-google.js"
+    "taste:google": "node taste-profile-google.js",
+    "import-history": "node scripts/import-history.js"
   },
   "keywords": ["spotify", "daily-drive", "playlist", "podcast", "automation", "raspberry-pi", "orange-pi"],
   "license": "MIT",
