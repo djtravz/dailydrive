@@ -242,7 +242,7 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
           const durationMs = episode.duration_ms ?? 0;
           const remainingMs = durationMs > 0 ? durationMs - resumeMs : Infinity;
 
-          if (fullyPlayed || remainingMs <= COMPLETED_THRESHOLD_MS) {
+          if (fullyPlayed || (resumeMs > 0 && remainingMs <= COMPLETED_THRESHOLD_MS)) {
             const reason = fullyPlayed ? "fully played" : `${Math.round(remainingMs / 60000)}min remaining`;
             console.log(`    ⏭️  Most recent Sunday episode already listened (${reason}): ${episode.name}`);
           } else {
@@ -279,7 +279,7 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
           const resumeMs = rp?.resume_position_ms ?? 0;
           const durationMs = episode.duration_ms ?? 0;
           const remainingMs = durationMs > 0 ? durationMs - resumeMs : Infinity;
-          const listened = fullyPlayed || remainingMs <= COMPLETED_THRESHOLD_MS;
+          const listened = fullyPlayed || (resumeMs > 0 && remainingMs <= COMPLETED_THRESHOLD_MS);
           const isFresh = episode.release_date === todayUTC;
           const isSunday = new Date(episode.release_date).getUTCDay() === 0;
           const blockedBySunday = podcast.skip_sunday && isSunday;
@@ -292,6 +292,7 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
           } else {
             const reason = blockedBySunday
               ? `Sunday episode — handled by sunday_only slot`
+              : !isFresh ? `not from today (${episode.release_date})`
               : fullyPlayed ? "fully played"
               : `${Math.round(remainingMs / 60000)}min remaining`;
             console.log(`    ⏭️  Primary not used (${reason}): ${episode.name} [${episode.release_date}]`);
@@ -320,7 +321,7 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
               const durationMs = episode.duration_ms ?? 0;
               const remainingMs = durationMs > 0 ? durationMs - resumeMs : Infinity;
 
-              if (!fullyPlayed && remainingMs > COMPLETED_THRESHOLD_MS) {
+              if (!fullyPlayed && (resumeMs === 0 || remainingMs > COMPLETED_THRESHOLD_MS)) {
                 episodes.push({ uri: episode.uri, name: episode.name, show: backupShow.name, type: "episode", position: podcast.position || null });
                 console.log(`    📻 Using backup [${backupShow.name}]: ${episode.name}`);
                 backupAdded = true;
@@ -361,7 +362,7 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
           const durationMs = episode.duration_ms ?? 0;
           const remainingMs = durationMs > 0 ? durationMs - resumeMs : Infinity;
 
-          if (fullyPlayed || remainingMs <= COMPLETED_THRESHOLD_MS) {
+          if (fullyPlayed || (resumeMs > 0 && remainingMs <= COMPLETED_THRESHOLD_MS)) {
             const reason = fullyPlayed ? "fully played" : `${Math.round(remainingMs / 60000)}min remaining`;
             console.log(`    ⏭️  Sunday episode already listened (${reason}): ${episode.name}`);
           } else {
@@ -473,7 +474,7 @@ async function fetchGroupEpisodes(spotifyApi, groups) {
           const remainingMs = durationMs > 0 ? durationMs - resumeMs : Infinity;
           const COMPLETED_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 
-          if (fullyPlayed || remainingMs <= COMPLETED_THRESHOLD_MS) {
+          if (fullyPlayed || (resumeMs > 0 && remainingMs <= COMPLETED_THRESHOLD_MS)) {
             console.log(
               `      ⏭️  Skipping (${fullyPlayed ? "fully played" : `${Math.round(remainingMs / 60000)}min remaining`}): [${show.name}] ${episode.name}`
             );
